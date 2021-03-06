@@ -1,0 +1,208 @@
+# Rodriguez Vazquez Joshua
+
+## Datos
+
+### Descargando
+```{R}
+library("recount3")
+
+human_projects <- available_projects()
+rse_gene_SRP115956 <- create_rse(
+    subset(
+        human_projects,
+        project == "SRP115956" & project_type == "data_sources"
+    )
+)
+```
+
+### Explorando nuestros datos
+
+```{R}
+assay(rse_gene_SRP115956, "counts") <- compute_read_counts(rse_gene_SRP115956)
+rse_gene_SRP115956 <- expand_sra_attributes(rse_gene_SRP115956)
+
+colData(rse_gene_SRP115956)[
+    ,
+    grepl("^sra_attribute", colnames(colData(rse_gene_SRP115956)))
+]
+```
+
+### Modificando los datos inconsistentes
+
+```{R}
+rse_gene_SRP115956$sra_attribute.alcool <- replace(
+    rse_gene_SRP115956$sra_attribute.alcool,
+    rse_gene_SRP115956$sra_attribute.alcool=="No"|
+    rse_gene_SRP115956$sra_attribute.alcool=="NA","no")
+rse_gene_SRP115956$sra_attribute.medication <- replace(
+    rse_gene_SRP115956$sra_attribute.medication,
+    rse_gene_SRP115956$sra_attribute.medication=="No"|
+    rse_gene_SRP115956$sra_attribute.medication=="NA","no")
+
+rse_gene_SRP115956$sra_attribute.age <- as.numeric(rse_gene_SRP115956$sra_attribute.age)
+rse_gene_SRP115956$sra_attribute.alcool <- factor(rse_gene_SRP115956$sra_attribute.alcool)
+rse_gene_SRP115956$sra_attribute.rin <- as.numeric(rse_gene_SRP115956$sra_attribute.rin)
+rse_gene_SRP115956$sra_attribute.gender <- factor(rse_gene_SRP115956$sra_attribute.gender)
+rse_gene_SRP115956$sra_attribute.medication <- factor(rse_gene_SRP115956$sra_attribute.medication)
+
+summary(as.data.frame(colData(rse_gene_SRP115956)[
+    ,
+    grepl("^sra_attribute.[age|alcool|rin|gender|medication]", colnames(colData(rse_gene_SRP115956)))
+]))
+```
+
+## Calidad de nuestras lecturas
+
+```{R}
+rse_gene_SRP115956$assigned_gene_prop <- rse_gene_SRP115956$recount_qc.gene_fc_count_all.assigned / rse_gene_SRP115956$recount_qc.gene_fc_count_all.total
+summary(rse_gene_SRP115956$assigned_gene_prop)
+
+with(colData(rse_gene_SRP115956), plot(assigned_gene_prop, sra_attribute.rin))
+```
+
+### Filtramos las lecturas de mala calidad
+
+```{R}
+rse_gene_SRP115956_unfiltered <- rse_gene_SRP115956
+
+
+hist(rse_gene_SRP115956$assigned_gene_prop)
+table(rse_gene_SRP115956$assigned_gene_prop < 0.3)
+rse_gene_SRP115956 <- rse_gene_SRP115956[, rse_gene_SRP115956$assigned_gene_prop > 0.3]
+```
+
+## Niveles de expresion
+
+```{R}
+gene_means <- rowMeans(assay(rse_gene_SRP115956, "counts"))
+summary(gene_means)
+rse_gene_SRP115956 <- rse_gene_SRP115956[gene_means > 0.1, ]
+```
+
+### Una vez filtrados los genes con baja expresion
+
+```{R}
+dim(rse_gene_SRP115956)
+round(nrow(rse_gene_SRP115956) / nrow(rse_gene_SRP115956_unfiltered) * 100, 2)
+```
+
+## Normalizando los datos
+
+```{R}
+library("edgeR")
+dge <- DGEList(
+    counts = assay(rse_gene_SRP115956, "counts"),
+    genes = rowData(rse_gene_SRP115956)
+)
+dge <- calcNormFactors(dge)
+```
+
+### Separamos por grupos de edad
+(Quería hacer varios pero no descubrí comí)
+
+```{R}
+rse_gene_SRP115956$minor <- factor(ifelse(rse_gene_SRP115956$sra_attribute.age < 21, "minor", "adult"))
+table(rse_gene_SRP115956$minor)
+```
+
+## Expresion diferencial
+
+```{R}
+library("ggplot2")
+ggplot(as.data.frame(colData(rse_gene_SRP115956)), aes(y = assigned_gene_prop, x = minor)) +
+    geom_boxplot() +
+    theme_bw(base_size = 20) +
+    ylab("Assigned Gene Prop") +
+    xlab("Age Group")
+```
+
+## Generando el  modelo
+
+```{R}
+mod <- model.matrix(~ minor + sra_attribute.rin + sra_attribute.gender + assigned_gene_prop,
+    data = colData(rse_gene_SRP115956)
+)
+colnames(mod)
+```
+
+### Voom
+
+```{R}
+library("limma")
+vGene <- voom(dge, mod, plot = TRUE)
+```
+
+### Aplicando bayes
+
+```{R}
+eb_results <- eBayes(lmFit(vGene))
+
+de_results <- topTable(
+    eb_results,
+    coef = 2,
+    number = nrow(rse_gene_SRP115956),
+    sort.by = "none"
+)
+dim(de_results)
+head(de_results)
+
+```
+
+### Ploteamos
+
+```{R}
+table(de_results$adj.P.Val < 0.05)
+plotMA(eb_results, coef = 2)
+```
+
+### Volcano
+
+```{R}
+volcanoplot(eb_results, coef = 2, highlight = 3, names = de_results$gene_name)
+```
+
+```{R}
+de_results[de_results$gene_name %in% c("MTCO3P", "FRG1EP", "IMMP2L"), ]
+```
+
+### Heatmap
+
+```{R}
+exprs_heatmap <- vGene$E[rank(de_results$adj.P.Val) <= 50, ]
+
+df <- as.data.frame(colData(rse_gene_SRP115956)[, c("minor", "sra_attribute.rin", "sra_attribute.gender")])
+colnames(df) <- c("AgeGroup", "RIN", "Gender")
+
+
+library("pheatmap")
+pheatmap(
+    exprs_heatmap,
+    cluster_rows = TRUE,
+    cluster_cols = TRUE,
+    show_rownames = FALSE,
+    show_colnames = FALSE,
+    annotation_col = df
+)
+```
+
+### Ploteamos por grupo de edad
+
+```{R}
+library("RColorBrewer")
+
+col.group <- df$AgeGroup
+levels(col.group) <- brewer.pal(nlevels(col.group), "Set1")
+col.group <- as.character(col.group)
+plotMDS(vGene$E, labels = df$AgeGroup, col = col.group)
+```
+
+### Ploteamos por sexo
+
+```{R}
+col.gender <- df$Gender
+
+levels(col.gender) <- brewer.pal(nlevels(col.gender), "Dark2")
+col.gender <- as.character(col.gender)
+
+plotMDS(vGene$E, labels = df$Gender, col = col.gender)
+```
